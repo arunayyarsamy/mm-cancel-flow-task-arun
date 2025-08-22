@@ -82,137 +82,122 @@ export async function fetchLatestSubscription(userId: string): Promise<Subscript
 
   // RPC returning TABLE can come back as an array (0..1 rows) depending on PostgREST
   const row = Array.isArray(data) ? data?.[0] : data
-  console.log(row)
   return (row as SubscriptionRow) ?? null
 }
 
-// --- Write helpers used by the cancellation flow ---------------------
+// --- RPC helpers (RLS-safe) ---------------------------------------
 
-/** Mark subscription as pending cancellation. */
-export async function markSubscriptionPendingCancellation(userId: string): Promise<void> {
+export async function beginCancellation(userId: string, variant: 'A' | 'B' | null) {
   if (!userId) throw new Error('userId required')
-  const { error } = await supabase
-    .from('subscriptions')
-    .update({ pending_cancellation: true, status: 'pending_cancellation' })
-    .eq('user_id', userId)
+  const { data, error } = await supabase.rpc('begin_cancellation', {
+    p_user_id: userId,
+    p_downsell_variant: variant,
+  })
+  if (error) throw error
+  const row = Array.isArray(data) ? data?.[0] : data
+  return row as { cancellation_id: string; downsell_variant: 'A' | 'B' | null }
+}
 
+export async function acceptDownsell(cancellationId: string) {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase.rpc('accept_downsell', { p_cancellation_id: cancellationId })
   if (error) throw error
 }
 
-/**
- * Create (or reuse latest) cancellation row and persist downsell variant once.
- * Deterministic behavior is handled by the caller’s first-assignment; we simply
- * refuse to overwrite an existing variant if one exists.
- */
-export async function createOrReuseCancellation(
-  userId: string,
-  params: { subscriptionId?: string | null; variant: 'A' | 'B' }
-): Promise<CancellationRow> {
-  if (!userId) throw new Error('userId required')
-
-  // If a recent cancellation exists with a variant, reuse it.
-  const { data: existing, error: qErr } = await supabase
-    .from('cancellations')
-    .select('id,user_id,subscription_id,downsell_variant,accepted_downsell,created_at')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-
-  if (qErr) throw qErr
-  const row = existing?.[0] as CancellationRow | undefined
-  if (row && row.downsell_variant) {
-    return row
+export async function saveFoundJobAnswersRpc(
+  cancellationId: string,
+  payload: {
+    attributed_to_mm: boolean | null
+    applied_count: '0' | '1-5' | '6-20' | '20+' | ''
+    emailed_count: '0' | '1-5' | '6-20' | '20+' | ''
+    interview_count: '0' | '1-2' | '3-5' | '5+' | ''
+    reason?: string
   }
+) {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase.rpc('save_found_job_answers', {
+    p_cancellation_id: cancellationId,
+    p_attributed_to_mm: payload.attributed_to_mm,
+    p_applied: payload.applied_count || null,
+    p_emailed: payload.emailed_count || null,
+    p_interview: payload.interview_count || null,
+    p_reason: (payload.reason ?? '').trim() || null,
+  })
+  if (error) throw error
+}
 
-  // Insert a new row with the assigned variant (or set variant on latest null one)
-  if (row && !row.downsell_variant) {
-    const { data: updated, error: uErr } = await supabase
-      .from('cancellations')
-      .update({ downsell_variant: params.variant })
-      .eq('id', row.id)
-      .select('*')
-      .single()
-    if (uErr) throw uErr
-    return updated as CancellationRow
-  }
+export async function finalizeFoundJob(cancellationId: string, hasLawyer: boolean, visaType: string) {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase.rpc('finalize_found_job', {
+    p_cancellation_id: cancellationId,
+    p_visa_has_lawyer: hasLawyer,
+    p_visa_type: (visaType ?? '').trim(),
+  })
+  if (error) throw error
+}
 
-  const { data: inserted, error: iErr } = await supabase
-    .from('cancellations')
-    .insert({
-      user_id: userId,
-      subscription_id: params.subscriptionId ?? null,
-      downsell_variant: params.variant,
+export async function finalizeStillLooking(cancellationId: string, reason: string) {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase.rpc('finalize_still_looking', {
+    p_cancellation_id: cancellationId,
+    p_reason: (reason ?? '').trim(),
+  })
+  if (error) throw error
+}
+
+export async function assignBalancedDownsell(userId: string) {
+    if (!userId) throw new Error('userId required')
+    const { data, error } = await supabase.rpc('assign_balanced_downsell', {
+      p_user_id: userId,
     })
-    .select('*')
-    .single()
+    if (error) throw error
 
-  if (iErr) throw iErr
-  return inserted as CancellationRow
-}
-
-/** Patch a cancellation row (only minimal fields we use). */
-export async function updateCancellation(
-  id: string,
-  patch: Partial<Omit<CancellationRow, 'id' | 'user_id'>>
-): Promise<void> {
-  if (!id) throw new Error('cancellation id required')
-  const { error } = await supabase
-    .from('cancellations')
-    .update(patch)
-    .eq('id', id)
-
-  if (error) throw error
-}
-
-// --- Found Job / Cancellation extensions ------------------------------
-
-/** Ensure a cancellation row exists for a user (create if not) */
-export async function ensureCancellation(userId: string, subscriptionId?: string | null): Promise<CancellationRow> {
-  if (!userId) throw new Error('userId required')
-  const { data: row, error } = await supabase
-    .from('cancellations')
-    .insert({ user_id: userId, subscription_id: subscriptionId ?? null })
-    .select('*')
-    .single()
-  if (error) throw error
-  return row as CancellationRow
-}
-
-/** Save mini‑survey answers about found job experience */
-export async function saveFoundJobAnswers(cancellationId: string, answers: {
-  attributed_to_mm?: boolean
-  applied_count?: '0' | '1-5' | '6-20' | '20+'
-  emailed_count?: '0' | '1-5' | '6-20' | '20+'
-  interview_count?: '0' | '1-2' | '3-5' | '5+'
-}): Promise<void> {
-  if (!cancellationId) throw new Error('cancellationId required')
-  const { error } = await supabase
-    .from('cancellations')
-    .update(answers)
-    .eq('id', cancellationId)
-  if (error) throw error
-}
-
-/** Finalize cancellation row after found job flow */
-export async function finalizeFoundJobCancellation(cancellationId: string): Promise<void> {
-  if (!cancellationId) throw new Error('cancellationId required')
-  const { error } = await supabase
-    .from('cancellations')
-    .update({ reason: 'found_job' })
-    .eq('id', cancellationId)
-  if (error) throw error
-}
-
-// Namespaced export for integration
-export const CancellationFlowPersist = {
-  ensureCancellation,
-  saveFoundJobAnswers,
-  finalizeFoundJobCancellation,
-} as const
+    console.log(data, error)
+  
+    // PostgREST can serialize a RETURNS TABLE/RECORD as either a row object,
+    // an array with a single row, or a TEXT tuple depending on function shape.
+    // Handle all cases defensively.
+    const raw = Array.isArray(data) ? data?.[0] : data
+  
+    // 1) Direct object shape
+    if (raw && typeof raw === 'object' && 'cancellation_id' in raw && 'downsell_variant' in raw) {
+      const r = raw as { cancellation_id?: string; downsell_variant?: 'A' | 'B' | string }
+      if (r.cancellation_id && (r.downsell_variant === 'A' || r.downsell_variant === 'B')) {
+        return {
+          cancellation_id: r.cancellation_id,
+          downsell_variant: r.downsell_variant as 'A' | 'B',
+        }
+      }
+    }
+  
+    // 2) TEXT tuple e.g. "(uuid,A)" or ("uuid",A)
+    if (typeof data === 'string' || typeof raw === 'string') {
+      const s = String(raw ?? data)
+      const m = s.match(/\(?["']?([0-9a-fA-F-]{36})["']?\s*,\s*([AB])\)?/)
+      if (m) {
+        return { cancellation_id: m[1], downsell_variant: m[2] as 'A' | 'B' }
+      }
+      // Sometimes the RPC may return a JSON string
+      try {
+        const maybe = JSON.parse(s)
+        if (maybe?.cancellation_id && (maybe.downsell_variant === 'A' || maybe.downsell_variant === 'B')) {
+          return {
+            cancellation_id: String(maybe.cancellation_id),
+            downsell_variant: maybe.downsell_variant as 'A' | 'B',
+          }
+        }
+      } catch {}
+    }
+  
+    throw new Error('assign_balanced_downsell returned no data')
+  }
 
 // --- Small utility ---------------------------------------------------
 
-/** Secure 50/50 variant chooser (A/B). Caller persists via createOrReuseCancellation. */
+/**
+ * Fallback local 50/50 chooser (crypto-strong when available).
+ * Prefer server-side `assignBalancedDownsell` for perfectly balanced groups.
+ */
 export function chooseVariantAB(): 'A' | 'B' {
   if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
     const buf = new Uint32Array(1)

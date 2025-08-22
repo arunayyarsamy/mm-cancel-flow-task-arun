@@ -401,9 +401,11 @@ export default function ProfilePage() {
       </div>
       
       {/* Cancellation Modal */}
-      <CancellationModal 
-        isOpen={showCancellationModal} 
-        onClose={() => setShowCancellationModal(false)} 
+      <CancellationModal
+        isOpen={showCancellationModal}
+        onClose={() => setShowCancellationModal(false)}
+        userId={selectedUserId}
+        userEmail={selectedEmail}
       />
     </div>
   );
