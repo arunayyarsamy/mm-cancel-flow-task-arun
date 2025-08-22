@@ -12,6 +12,18 @@ const COLORS = {
   successStrong: '#2ea743',
 };
 
+// --- Client-side input sanitization helpers ---
+const MAX_TEXT_LEN = 1000;
+function sanitizeText(input: string): string {
+  if (!input) return '';
+  // Remove HTML tags
+  const noTags = input.replace(/<[^>]*>/g, '');
+  // Neutralize common URL/script vectors
+  const noSchemes = noTags.replace(/javascript:/gi, '').replace(/data:text\/html/gi, '');
+  // Collapse whitespace & trim, clamp length
+  return noSchemes.replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT_LEN);
+}
+
 
 type CancellationStep = 'initial' | 'job-status' | 'downsell' | 'downsell-accepted' | 'using' | 'reasons' | 'feedback' | 'confirmation' | 'completed';
 
@@ -135,13 +147,13 @@ export default function CancellationModal({ isOpen, onClose, userId, userEmail }
     try {
       // Persist step 1+2 answers only for found-job branch
       if (selectedOption === 'found-job' && cancellationId) {
-        const trimmed = feedback.trim();
+        const trimmed = sanitizeText(feedback);
         await saveFoundJobAnswersRpc(cancellationId, {
           attributed_to_mm: (attributedToMM ?? null),
           applied_count: (appliedCount ?? '') as '' | '0' | '1-5' | '6-20' | '20+',
           emailed_count: (emailedCount ?? '') as '' | '0' | '1-5' | '6-20' | '20+',
           interview_count: (interviewCount ?? '') as '' | '0' | '1-2' | '3-5' | '5+',
-          reason: trimmed.length > 0 ? trimmed : null,
+          reason: trimmed.length > 0 ? trimmed : undefined,
         });
       }
     } catch (e) {
@@ -630,9 +642,9 @@ export default function CancellationModal({ isOpen, onClose, userId, userEmail }
                           onChange={(e) => setReasonText(e.target.value)}
                           onBlur={() => setReasonTouched(true)}
                           rows={5}
-                          className={`w-full rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 resize-none bg-white text-gray-900 placeholder-gray-400 ${reasonTouched && reasonText.trim().length < 25 ? 'border-red-400 focus:ring-red-300' : 'border-gray-300'}`}
+                          className={`w-full rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 resize-none bg-white text-gray-900 placeholder-gray-400 ${reasonTouched && sanitizeText(reasonText).length < 25 ? 'border-red-400 focus:ring-red-300' : 'border-gray-300'}`}
                         />
-                        <div className="pointer-events-none absolute bottom-2 right-3 text-xs text-gray-500">Min 25 characters ({Math.min(reasonText.trim().length,25)}/25)</div>
+                        <div className="pointer-events-none absolute bottom-2 right-3 text-xs text-gray-500">Min 25 characters ({Math.min(sanitizeText(reasonText).length,25)}/25)</div>
                       </div>
                     </div>
                   ) : null}
@@ -660,14 +672,17 @@ export default function CancellationModal({ isOpen, onClose, userId, userEmail }
                   )}
 
                   <button
-                    disabled={!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25)}
+                    disabled={!reasonChoice || (reasonChoice !== 'too_expensive' && sanitizeText(reasonText).length < 25)}
                     className={`w-full rounded-2xl px-4 py-3 text-[15px] font-semibold transition-colors ${!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25) ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'text-white'}`}
                     style={!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25) ? undefined : { backgroundColor: hoverCompleteCancel ? COLORS.brandStrong : COLORS.brand }}
-                    onMouseEnter={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || reasonText.trim().length >= 25)) setHoverCompleteCancel(true); }}
-                    onMouseLeave={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || reasonText.trim().length >= 25)) setHoverCompleteCancel(false); }}
+                    onMouseEnter={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || sanitizeText(reasonText).length >= 25)) setHoverCompleteCancel(true); }}
+                    onMouseLeave={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || sanitizeText(reasonText).length)) setHoverCompleteCancel(false); }}
                     onClick={async () => {
                       if (cancellationId) {
-                        const text = reasonChoice === 'too_expensive' ? (maxPrice ? `Too expensive; willing to pay $${maxPrice}` : 'Too expensive') : reasonText.trim();
+                        const raw = reasonChoice === 'too_expensive'
+                                      ? (maxPrice ? `Too expensive; willing to pay $${maxPrice}` : 'Too expensive')
+                                      : reasonText;
+                        const text = sanitizeText(raw);
                         try { await finalizeStillLooking(cancellationId, text ?? ''); } catch (e) { console.error('Failed to finalize cancellation', e); return; }
                       }
                       setVisaHasLawyer(false);
@@ -736,7 +751,7 @@ export default function CancellationModal({ isOpen, onClose, userId, userEmail }
                         rows={5}
                       />
                       <div className="pointer-events-none absolute bottom-2 right-3 text-xs text-gray-500">
-                        Min {MIN_FEEDBACK} characters ({Math.min(feedback.trim().length, MIN_FEEDBACK)}/{MIN_FEEDBACK})
+                        Min {MIN_FEEDBACK} characters ({Math.min(sanitizeText(feedback).length, MIN_FEEDBACK)}/{MIN_FEEDBACK})
                       </div>
                     </div>
 
@@ -853,23 +868,23 @@ export default function CancellationModal({ isOpen, onClose, userId, userEmail }
                         onClick={async () => {
                           if (cancellationId) {
                             try {
-                              await finalizeFoundJob(cancellationId, !!visaHasLawyer, visaType.trim());
+                              await finalizeFoundJob(cancellationId, !!visaHasLawyer, sanitizeText(visaType));
                             } catch (e) { console.error('Failed to finalize cancellation', e); return; }
                           }
                           setCurrentStep('completed');
                         }}
-                        disabled={visaHasLawyer === null || visaType.trim() === ''}
+                        disabled={visaHasLawyer === null || sanitizeText(visaType) === ''}
                         className={'w-full rounded-2xl px-4 py-3 text-[15px] font-semibold transition-colors ' +
-                          (visaHasLawyer === null || visaType.trim() === ''
+                          (visaHasLawyer === null || sanitizeText(visaType) === ''
                             ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
                             : 'text-white')}
                         style={
-                          visaHasLawyer === null || visaType.trim() === ''
+                          visaHasLawyer === null || sanitizeText(visaType) === ''
                             ? undefined
                             : { backgroundColor: hoverCompleteCancel ? COLORS.brandStrong : COLORS.brand }
                         }
-                        onMouseEnter={() => { if (!(visaHasLawyer === null || visaType.trim() === '')) setHoverCompleteCancel(true); }}
-                        onMouseLeave={() => { if (!(visaHasLawyer === null || visaType.trim() === '')) setHoverCompleteCancel(false); }}
+                        onMouseEnter={() => { if (!(visaHasLawyer === null || sanitizeText(visaType) === '')) setHoverCompleteCancel(true); }}
+                        onMouseLeave={() => { if (!(visaHasLawyer === null || sanitizeText(visaType) === '')) setHoverCompleteCancel(false); }}
                       >
                         Complete cancellation
                       </button>
