@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { fetchUsers } from '../lib/supabase';
 import CancellationModal from '../components/CancellationModal';
 
 // Mock user data for UI display
@@ -29,6 +30,34 @@ export default function ProfilePage() {
   // New state for settings toggle
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [showCancellationModal, setShowCancellationModal] = useState(false);
+
+  // DB-backed user selector state
+  const [dbUsers, setDbUsers] = useState<Array<{ id: string; email: string }>>([]);
+  const [selectedUserId, setSelectedUserId] = useState<string>('');
+  const [dbLoading, setDbLoading] = useState<boolean>(false);
+  const [dbError, setDbError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        setDbLoading(true);
+        setDbError(null);
+        const users = await fetchUsers();
+        if (!alive) return;
+        setDbUsers(users);
+        setSelectedUserId(users.length ? users[0].id : '');
+      } catch (e) {
+        if (!alive) return;
+        setDbError('Failed to load users');
+      } finally {
+        if (alive) setDbLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const selectedEmail = (dbUsers.find(u => u.id === selectedUserId)?.email) || mockUser.email;
 
   const handleSignOut = async () => {
     setIsSigningOut(true);
@@ -110,7 +139,7 @@ export default function ProfilePage() {
                 <span className="sm:hidden">Profile</span>
                 <span className="hidden sm:inline">My Profile</span>
               </h1>
-              <div className="flex space-x-3">
+              <div className="flex space-x-3 items-center relative">
                 <button
                   onClick={handleClose}
                   className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-[#8952fc] rounded-lg hover:bg-[#7b40fc] transition-colors"
@@ -135,11 +164,30 @@ export default function ProfilePage() {
           
           {/* Profile Info */}
           <div className="px-6 py-6 border-b border-gray-200">
+            {/* User selector (test-only) */}
+            <div className="mb-4">
+              <label htmlFor="db-user-select" className="block text-sm font-medium text-gray-700 mb-1">Select user</label>
+              <select
+                id="db-user-select"
+                value={selectedUserId}
+                onChange={(e) => setSelectedUserId(e.target.value)}
+                disabled={dbLoading}
+                className="block w-full rounded-md border border-gray-300 bg-white shadow-sm px-3 py-2 text-gray-900 text-base focus:border-[#8952fc] focus:ring-[#8952fc] disabled:bg-gray-50 disabled:text-gray-400"
+              >
+                <option value="" disabled className="text-gray-400">Select a user…</option>
+                {dbLoading && <option>Loading users…</option>}
+                {!dbLoading && dbUsers.length === 0 && <option value="">No users found</option>}
+                {!dbLoading && dbUsers.map(u => (
+                  <option key={u.id} value={u.id} className="text-gray-900">{u.email}</option>
+                ))}
+              </select>
+              {dbError && <p className="mt-1 text-xs text-red-600">{dbError}</p>}
+            </div>
             <h2 className="text-lg font-medium text-gray-900 mb-4">Account Information</h2>
             <div className="space-y-3">
               <div>
                 <p className="text-sm font-medium text-gray-500">Email</p>
-                <p className="mt-1 text-md text-gray-900">{mockUser.email}</p>
+                <p className="mt-1 text-md text-gray-900">{selectedEmail}</p>
               </div>
               <div className="pt-2 space-y-3">
                 <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">

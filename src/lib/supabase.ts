@@ -1,20 +1,181 @@
 // src/lib/supabase.ts
 // Supabase client configuration for database connections
 // Does not include authentication setup or advanced features
+// src/lib/supabase.ts
+// Supabase client & tiny data-access helpers used across the app.
+// Keeps all DB I/O in one place. No server-role client here.
 
 import { createClient } from '@supabase/supabase-js'
 
+// --- Client -----------------------------------------------------------
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 
-console.log('supabaseUrl', supabaseUrl)
-console.log('supabaseAnonKey', supabaseAnonKey)
-console.log('process.env.SUPABASE_SERVICE_ROLE_KEY', process.env.SUPABASE_SERVICE_ROLE_KEY)
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    // We don't use OAuth in this task; avoid parsing the URL for sessions
+    detectSessionInUrl: false,
+    // Avoid writing tokens to localStorage/cookies in this mock app
+    persistSession: false,
+    // No auto refresh needed without persisted sessions
+    autoRefreshToken: false,
+  },
+})
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+// --- Types (mirrors minimal columns we actually use) ------------------
+export type DbUser = { id: string; email: string; created_at?: string | null }
 
-// Server-side client with service role key for admin operations
-// export const supabaseAdmin = createClient(
-//   supabaseUrl,
-//   process.env.SUPABASE_SERVICE_ROLE_KEY!
-// ) 
+export type SubscriptionRow = {
+  id?: string
+  user_id: string
+  status?: 'active' | 'pending_cancellation' | 'cancelled' | 'trialing' | 'past_due' | string | null
+  pending_cancellation?: boolean | null
+  current_period_end?: string | null
+  monthly_price?: number | null
+  created_at?: string | null
+}
+
+export type CancellationRow = {
+  id: string
+  user_id: string
+  subscription_id?: string | null
+  downsell_variant?: 'A' | 'B' | null
+  accepted_downsell?: boolean | null
+  reason?: string | null
+  // mini-survey
+  attributed_to_mm?: boolean | null
+  applied_count?: '0' | '1-5' | '6-20' | '20+' | null
+  emailed_count?: '0' | '1-5' | '6-20' | '20+' | null
+  interview_count?: '0' | '1-2' | '3-5' | '5+' | null
+  // visa step
+  visa_has_lawyer?: boolean | null
+  visa_type?: string | null
+  created_at?: string | null
+}
+
+// --- Read helpers ----------------------------------------------------
+
+/**
+ * Load all users (for the selector).
+ * We use a restricted view (user_emails_view) to maintain RLS and only expose id, email, and created_at,
+ * instead of querying the full users table directly.
+ */
+export async function fetchUsers(): Promise<DbUser[]> {
+  const { data, error } = await supabase
+    .from('user_emails_view')
+    .select('id,email')
+    .order('created_at', { ascending: true })
+
+  if (error) throw error
+  return (data ?? []) as DbUser[]
+}
+
+/** Load the most recent subscription for a user. */
+export async function fetchLatestSubscription(userId: string): Promise<SubscriptionRow | null> {
+
+    console.log('fetchLatestSubscription', userId)
+  if (!userId) return null
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('id,user_id,status,monthly_price,created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+    console.log('fetchLatestSubscription', data, error)
+
+  if (error) throw error
+  return (data as SubscriptionRow) ?? null
+}
+
+// --- Write helpers used by the cancellation flow ---------------------
+
+/** Mark subscription as pending cancellation. */
+export async function markSubscriptionPendingCancellation(userId: string): Promise<void> {
+  if (!userId) throw new Error('userId required')
+  const { error } = await supabase
+    .from('subscriptions')
+    .update({ pending_cancellation: true, status: 'pending_cancellation' })
+    .eq('user_id', userId)
+
+  if (error) throw error
+}
+
+/**
+ * Create (or reuse latest) cancellation row and persist downsell variant once.
+ * Deterministic behavior is handled by the caller’s first-assignment; we simply
+ * refuse to overwrite an existing variant if one exists.
+ */
+export async function createOrReuseCancellation(
+  userId: string,
+  params: { subscriptionId?: string | null; variant: 'A' | 'B' }
+): Promise<CancellationRow> {
+  if (!userId) throw new Error('userId required')
+
+  // If a recent cancellation exists with a variant, reuse it.
+  const { data: existing, error: qErr } = await supabase
+    .from('cancellations')
+    .select('id,user_id,subscription_id,downsell_variant,accepted_downsell,created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+
+  if (qErr) throw qErr
+  const row = existing?.[0] as CancellationRow | undefined
+  if (row && row.downsell_variant) {
+    return row
+  }
+
+  // Insert a new row with the assigned variant (or set variant on latest null one)
+  if (row && !row.downsell_variant) {
+    const { data: updated, error: uErr } = await supabase
+      .from('cancellations')
+      .update({ downsell_variant: params.variant })
+      .eq('id', row.id)
+      .select('*')
+      .single()
+    if (uErr) throw uErr
+    return updated as CancellationRow
+  }
+
+  const { data: inserted, error: iErr } = await supabase
+    .from('cancellations')
+    .insert({
+      user_id: userId,
+      subscription_id: params.subscriptionId ?? null,
+      downsell_variant: params.variant,
+    })
+    .select('*')
+    .single()
+
+  if (iErr) throw iErr
+  return inserted as CancellationRow
+}
+
+/** Patch a cancellation row (only minimal fields we use). */
+export async function updateCancellation(
+  id: string,
+  patch: Partial<Omit<CancellationRow, 'id' | 'user_id'>>
+): Promise<void> {
+  if (!id) throw new Error('cancellation id required')
+  const { error } = await supabase
+    .from('cancellations')
+    .update(patch)
+    .eq('id', id)
+
+  if (error) throw error
+}
+
+// --- Small utility ---------------------------------------------------
+
+/** Secure 50/50 variant chooser (A/B). Caller persists via createOrReuseCancellation. */
+export function chooseVariantAB(): 'A' | 'B' {
+  if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
+    const buf = new Uint32Array(1)
+    crypto.getRandomValues(buf)
+    return (buf[0] % 2 === 0) ? 'A' : 'B'
+  }
+  // Fallback (non-crypto environments)
+  return Math.random() < 0.5 ? 'A' : 'B'
+}
