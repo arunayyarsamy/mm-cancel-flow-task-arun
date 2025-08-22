@@ -1,186 +1,84 @@
-# Migrate Mate - Subscription Cancellation Flow Implementation
+# Submission Summary — Migrate Mate Cancellation Flow
 
-## Overview
+**Stack**: Next.js (App Router) + TypeScript + Tailwind + Supabase (Postgres + RLS)
 
-This repository contains a fully functional subscription cancellation flow for Migrate Mate, implemented with Next.js, TypeScript, Tailwind CSS, and Supabase. The implementation features a deterministic A/B testing system, comprehensive security measures, and pixel-perfect UI fidelity.
+## Architecture & Flow
+- `CancellationModal` orchestrates a 3-step progressive journey with two branches:
+  - **Found job**: congrats → attribution + usage questions → open visa helper → completion
+  - **Still looking**: optional downsell screen (Variant B) → usage → reason → completion
+- The modal is responsive (mobile/desktop), locks background scroll, and matches Figma spacing/typography with a shared `COLORS` palette (no inline hex).
 
-## Architecture Decisions
+## A/B Test (Deterministic 50/50)
+- On first entry, the client calls a Supabase RPC that:
+  1) Ensures (or creates) an open `cancellations` row for the user
+  2) Assigns a **single** downsell variant using a secure RNG, persisted to `cancellations.downsell_variant`
+- On subsequent entries the stored variant is reused (no re-randomization).
+- Variant B shows **$10 off** (e.g., $25→$15, $29→$19). Pricing is computed from `monthly_price_cents` and rendered everywhere it appears.
 
-### Component Structure
-- **CancellationFlow**: Main orchestrator managing flow state and transitions
-- **ConfirmCancellation**: Initial confirmation step with user verification
-- **DownsellOffer**: A/B variant B component offering $10 discount
-- **ReasonSelection**: Feedback collection with predefined and custom options
-- **CancellationComplete**: Final step with different outcomes based on user choice
+## Why a balanced deterministic allocator (vs. pure RNG)
+- **Fair but not balanced**: A cryptographically secure RNG is unbiased, but small cohorts can skew (e.g., 60/40) just by chance. The README requires a 50/50 split and practical parity between groups.
+- **Deterministic + minority-biased**: We assign on first entry by checking current counts in DB and giving the **minority** variant (tie → secure RNG). This keeps groups **near-perfectly balanced at all times**, not just “in expectation.”
+- **Persistence**: The assigned variant is stored on the user’s open cancellation row and **reused** on return visits—no re-randomization, no drift.
+- **Race-safety**: The assignment happens server-side in an RPC/transaction, avoiding concurrent skew.
 
-### State Management
-- Centralized flow state using React hooks
-- Deterministic A/B variant assignment based on user ID hash
-- Persistent cancellation records in Supabase database
+## Data Persistence
+- `subscriptions.status` is moved to `pending_cancellation` at the start of the journey (consistent with README).
+- `cancellations` captures: `user_id`, `downsell_variant`, `accepted_downsell`, `reason`, timestamps, and structured answers from both branches (attribution, applied/emailed/interviews, visa fields).
+- All writes happen via parameterized supabase-js calls or RPCs.
 
-### Database Design
-- Enhanced `cancellations` table with proper relationships
-- Row-Level Security (RLS) policies for data protection
-- Comprehensive tracking of user decisions and feedback
+## Security
+- **RLS**: users can only read/update their own rows; mutation helpers and SECURE functions are used to keep logic server-side.
+- **Input validation/XSS**:
+  - Client: all free-text inputs pass through a sanitizer (`sanitizeText`) that strips tags, dangerous schemes, normalizes whitespace, and clamps length.
+- **CSRF**: The app calls Supabase directly with anon keys (no cookie session), minimizing CSRF risk. As defense-in-depth we add a **CSP** header via `src/middleware.ts`. In dev, CSP allows `'unsafe-eval'` for Next tooling; in prod it is stricter.
+- **No dangerouslySetInnerHTML** is used; React’s default escaping applies.
 
-## Security Implementation
 
-### Row-Level Security (RLS)
-- Users can only access their own data
-- Cancellation records are user-scoped
-- Subscription updates require proper authentication
+## Setup
 
-### Input Validation & Sanitization
-- Type-safe interfaces for all user inputs
-- XSS prevention through input sanitization
-- CSRF protection with secure token generation
-
-### Data Protection
-- Sensitive operations require user verification
-- Secure handling of cancellation reasons
-- Audit trail for all cancellation activities
-
-## A/B Testing Approach
-
-### Deterministic Assignment
-- Variant assignment based on cryptographic hash of user ID
-- 50/50 split maintained consistently across sessions
-- No re-randomization on return visits
-
-### Variant Implementation
-- **Variant A**: Direct path to reason selection (no downsell)
-- **Variant B**: $10 discount offer ($25→$15, $29→$19)
-- Persistent variant storage in database
-
-### Data Collection
-- Tracks variant assignment, user decisions, and outcomes
-- Enables analysis of conversion rates and user behavior
-- Supports future optimization of retention strategies
-
-## Key Features
-
-### Progressive Flow
-- Multi-step cancellation journey with clear navigation
-- Responsive design optimized for mobile and desktop
-- Smooth transitions between flow states
-
-### User Experience
-- Clear messaging and visual hierarchy
-- Intuitive navigation with back/forward controls
-- Comprehensive feedback collection
-
-### Data Persistence
-- Complete cancellation lifecycle tracking
-- Subscription status management
-- User feedback and reason analysis
-
-## Technical Implementation
-
-### Frontend
-- React 19 with TypeScript for type safety
-- Tailwind CSS for responsive, modern UI
-- Component-based architecture for maintainability
-
-### Backend
-- Supabase for database and authentication
-- PostgreSQL with proper indexing and constraints
-- RESTful API design for data operations
-
-### Security
-- Comprehensive input validation
-- SQL injection prevention
-- XSS and CSRF protection
-
-## Setup Instructions
-
-1. **Clone the repository**
+1. Clone repo & install:  
    ```bash
-   git clone <repository-url>
-   cd cancel-flow-task-main
-   ```
-
-2. **Install dependencies**
-   ```bash
+   git clone <repo-url>
+   cd mm-cancel-flow-task-arun
    npm install
    ```
 
-3. **Set up environment variables**
-   ```bash
-   cp .env.example .env.local
-   # Update with your Supabase credentials
-   ```
-
-4. **Initialize database**
+2. Start local Supabase & seed DB:  
    ```bash
    npm run db:setup
    ```
 
-5. **Start development server**
-   ```bash
-   npm run dev
+3. Create `.env.local` with:
+   ```
+   NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=...
    ```
 
-## Database Schema
+4. Run dev server:  
+   ```bash
+   npm run dev
+   # open http://localhost:3000
+   ```
 
-### Users Table
-- Primary user information and authentication
-- Email-based identification system
+5. Use dropdown to pick a test user and go through cancellation flow.
 
-### Subscriptions Table
-- Active subscription details and pricing
-- Status tracking (active, pending_cancellation, cancelled)
+## Test UX: user dropdown
+- For evaluation convenience, I added a **read-only user dropdown** so reviewers can impersonate a seeded user and walk through the flow without implementing full auth.
+- This control reads from a minimal view (no PII beyond email/id) and only for seeded users. In production we would remove it and derive the active user from auth.
 
-### Cancellations Table
-- Complete cancellation lifecycle data
-- A/B variant assignment and user decisions
-- Feedback collection and analysis
+## Least-privilege exposure via Postgres views
+- To avoid exposing full `users` rows, the UI reads from a **whitelisted view** (e.g., `public.user_emails_view`) that projects only `id,email`.
+- RLS still applies on base tables; the view limits what columns are even visible to the anon client.
+- This lets the demo remain functional (select a user) while respecting **principle of least privilege**.
 
-## Testing & Validation
+## Notes & Tradeoffs
+- The downsell price uses the current plan’s cents → dollars, minus $10, never below $0.
+- Payment processing is intentionally stubbed (out of scope).
+- For evaluation convenience there is a user-selection dropdown (read-only view) controlled by tight RLS or a view; in a real app we’d use the authenticated user identity only.
+- CSS colors are centralized in `COLORS` for consistency and easier theming.
+- The completion screens differ by branch and visa selection per Figma.
 
-### A/B Testing
-- Deterministic variant assignment verified
-- Consistent user experience across sessions
-- Data integrity maintained throughout flow
-
-### Security Testing
-- RLS policies validated
-- Input sanitization verified
-- CSRF protection confirmed
-
-### User Experience
-- Mobile and desktop responsiveness tested
-- Flow navigation validated
-- Error handling verified
-
-## Future Enhancements
-
-### Analytics Integration
-- Conversion rate tracking
-- User behavior analysis
-- A/B test performance metrics
-
-### Payment Processing
-- Stripe integration for downsell acceptance
-- Automated billing adjustments
-- Payment method validation
-
-### User Communication
-- Email notifications for status changes
-- SMS reminders for pending cancellations
-- In-app messaging system
-
-## Performance Considerations
-
-- Optimized database queries with proper indexing
-- Efficient state management with React hooks
-- Responsive design with Tailwind CSS utilities
-- Minimal bundle size through code splitting
-
-## Security Best Practices
-
-- Principle of least privilege for database access
-- Input validation at multiple layers
-- Secure token generation and validation
-- Comprehensive error handling without information leakage
-
-This implementation provides a robust, secure, and user-friendly cancellation flow that effectively implements A/B testing while maintaining data integrity and user privacy.
+## Testing
+- A/B determinism verified by repeated entries (variant persists).
+- XSS tests with `<script>`/`javascript:` strings are neutralized in the UI and sanitized in DB.
+- CSP verified in dev and production modes.

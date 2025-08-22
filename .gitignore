@@ -43,3 +43,10 @@ next-env.d.ts
 
 # supabase
 supabase/
+
+
+
+tsconfig.json
+postcss.config.mjs
+package-lock.json
+/.vscode
