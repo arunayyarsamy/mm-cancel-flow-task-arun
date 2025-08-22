@@ -1,11 +1,15 @@
 // src/lib/supabase.ts
-// Supabase client configuration for database connections
-// Does not include authentication setup or advanced features
-// src/lib/supabase.ts
-// Supabase client & tiny data-access helpers used across the app.
-// Keeps all DB I/O in one place. No server-role client here.
+// Supabase client + focused data-access helpers used across the cancel flow.
+// Keeps DB I/O in one place. Uses RPCs (SECURITY DEFINER) to stay RLS-safe.
 
 import { createClient } from '@supabase/supabase-js'
+
+/**
+ * Normalize PostgREST results that may be a row object or a single-element array.
+ */
+function firstRow<T>(v: any): T | null {
+  return Array.isArray(v) ? (v?.[0] ?? null) : (v ?? null);
+}
 
 // --- Client -----------------------------------------------------------
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
@@ -28,9 +32,7 @@ export type DbUser = { id: string; email: string; created_at?: string | null }
 export type SubscriptionRow = {
   id?: string
   user_id: string
-  status?: 'active' | 'pending_cancellation' | 'cancelled' | 'trialing' | 'past_due' | string | null
-  pending_cancellation?: boolean | null
-  current_period_end?: string | null
+  status?: 'active' | 'pending_cancellation' | 'cancelled' | string | null
   monthly_price?: number | null
   created_at?: string | null
 }
@@ -55,12 +57,7 @@ export type CancellationRow = {
 
 // --- Read helpers ----------------------------------------------------
 
-/**
- * This is for tester only purpose
- * Load all users (for the selector).
- * We use a restricted view (user_emails_view) to maintain RLS and only expose id, email
- * instead of querying the full users table directly.
- */
+/** Load users for the tester-only selector via a narrow view (RLS-safe). */
 export async function fetchUsers(): Promise<DbUser[]> {
   const { data, error } = await supabase
     .from('user_emails_view')
@@ -70,7 +67,7 @@ export async function fetchUsers(): Promise<DbUser[]> {
   return (data ?? []) as DbUser[]
 }
 
-/** Load the most recent subscription for a user. */
+/** Fetch the latest subscription for a user via RPC (RLS-safe). */
 export async function fetchLatestSubscription(userId: string): Promise<SubscriptionRow | null> {
   if (!userId) return null
 
@@ -87,23 +84,17 @@ export async function fetchLatestSubscription(userId: string): Promise<Subscript
 
 // --- RPC helpers (RLS-safe) ---------------------------------------
 
-export async function beginCancellation(userId: string, variant: 'A' | 'B' | null) {
-  if (!userId) throw new Error('userId required')
-  const { data, error } = await supabase.rpc('begin_cancellation', {
-    p_user_id: userId,
-    p_downsell_variant: variant,
-  })
-  if (error) throw error
-  const row = Array.isArray(data) ? data?.[0] : data
-  return row as { cancellation_id: string; downsell_variant: 'A' | 'B' | null }
-}
-
+/** Mark the current cancellation as having accepted the downsell. */
 export async function acceptDownsell(cancellationId: string) {
   if (!cancellationId) throw new Error('cancellationId required')
   const { error } = await supabase.rpc('accept_downsell', { p_cancellation_id: cancellationId })
   if (error) throw error
 }
 
+/**
+ * Persist step-2 answers for the Found-a-Job branch via JSONB RPC.
+ * Server sanitizes HTML from `reason` and handles null/empty values.
+ */
 export async function saveFoundJobAnswersRpc(
   cancellationId: string,
   payload: {
@@ -114,18 +105,25 @@ export async function saveFoundJobAnswersRpc(
     reason?: string
   }
 ) {
-  if (!cancellationId) throw new Error('cancellationId required')
+  if (!cancellationId) throw new Error('cancellationId required');
+
+  // Build JSONB payload. Empty strings become nulls to avoid bad enums.
+  const payloadDb = {
+    attributed_to_mm: payload.attributed_to_mm,
+    applied_count: payload.applied_count === '' ? null : payload.applied_count,
+    emailed_count: payload.emailed_count === '' ? null : payload.emailed_count,
+    interview_count: payload.interview_count === '' ? null : payload.interview_count,
+    reason: (payload.reason ?? '').trim() || null,
+  } as const;
+
   const { error } = await supabase.rpc('save_found_job_answers', {
     p_cancellation_id: cancellationId,
-    p_attributed_to_mm: payload.attributed_to_mm,
-    p_applied: payload.applied_count || null,
-    p_emailed: payload.emailed_count || null,
-    p_interview: payload.interview_count || null,
-    p_reason: (payload.reason ?? '').trim() || null,
-  })
-  if (error) throw error
+    p_payload: payloadDb,
+  });
+  if (error) throw error;
 }
 
+/** Finalize the Found-a-Job path and set subscription status to cancelled. */
 export async function finalizeFoundJob(cancellationId: string, hasLawyer: boolean, visaType: string) {
   if (!cancellationId) throw new Error('cancellationId required')
   const { error } = await supabase.rpc('finalize_found_job', {
@@ -136,6 +134,7 @@ export async function finalizeFoundJob(cancellationId: string, hasLawyer: boolea
   if (error) throw error
 }
 
+/** Finalize the Still-Looking path and set subscription status to cancelled. */
 export async function finalizeStillLooking(cancellationId: string, reason: string) {
   if (!cancellationId) throw new Error('cancellationId required')
   const { error } = await supabase.rpc('finalize_still_looking', {
@@ -145,59 +144,127 @@ export async function finalizeStillLooking(cancellationId: string, reason: strin
   if (error) throw error
 }
 
+/**
+ * Ask the server to (idempotently) create/fetch the latest cancellation row
+ * and assign a balanced A/B variant. Returns the id + variant.
+ */
 export async function assignBalancedDownsell(userId: string) {
-    if (!userId) throw new Error('userId required')
-    const { data, error } = await supabase.rpc('assign_balanced_downsell', {
-      p_user_id: userId,
-    })
-    if (error) throw error
+  if (!userId) throw new Error('userId required');
+  const { data, error } = await supabase.rpc('assign_balanced_downsell', { p_user_id: userId });
+  if (error) throw error;
 
-    console.log(data, error)
-  
-    // PostgREST can serialize a RETURNS TABLE/RECORD as either a row object,
-    // an array with a single row, or a TEXT tuple depending on function shape.
-    // Handle all cases defensively.
-    const raw = Array.isArray(data) ? data?.[0] : data
-  
-    // 1) Direct object shape
-    if (raw && typeof raw === 'object' && 'cancellation_id' in raw && 'downsell_variant' in raw) {
-      const r = raw as { cancellation_id?: string; downsell_variant?: 'A' | 'B' | string }
-      if (r.cancellation_id && (r.downsell_variant === 'A' || r.downsell_variant === 'B')) {
-        return {
-          cancellation_id: r.cancellation_id,
-          downsell_variant: r.downsell_variant as 'A' | 'B',
-        }
-      }
+  // Supabase may return a single row or a single-element array
+  const raw = Array.isArray(data) ? data?.[0] : data;
+  if (raw && typeof raw === 'object') {
+    const r = raw as { cancellation_id?: string; downsell_variant?: 'A' | 'B' | string };
+    if (r.cancellation_id && (r.downsell_variant === 'A' || r.downsell_variant === 'B')) {
+      return { cancellation_id: r.cancellation_id, downsell_variant: r.downsell_variant as 'A' | 'B' };
     }
-  
-    // 2) TEXT tuple e.g. "(uuid,A)" or ("uuid",A)
-    if (typeof data === 'string' || typeof raw === 'string') {
-      const s = String(raw ?? data)
-      const m = s.match(/\(?["']?([0-9a-fA-F-]{36})["']?\s*,\s*([AB])\)?/)
-      if (m) {
-        return { cancellation_id: m[1], downsell_variant: m[2] as 'A' | 'B' }
-      }
-      // Sometimes the RPC may return a JSON string
-      try {
-        const maybe = JSON.parse(s)
-        if (maybe?.cancellation_id && (maybe.downsell_variant === 'A' || maybe.downsell_variant === 'B')) {
-          return {
-            cancellation_id: String(maybe.cancellation_id),
-            downsell_variant: maybe.downsell_variant as 'A' | 'B',
-          }
-        }
-      } catch {}
-    }
-  
-    throw new Error('assign_balanced_downsell returned no data')
   }
+  throw new Error('assign_balanced_downsell returned no data');
+}
+
+/**
+ * Retrieve the latest cancellation for a user. Prefers RPC; falls back to a
+ * direct table query (still constrained by RLS).
+ */
+export async function fetchLatestCancellationForUser(userId: string): Promise<CancellationRow | null> {
+  if (!userId) return null;
+
+  function dlog(...args: any[]) {
+    console.debug('[fetchLatestCancellationForUser]', ...args);
+  }
+
+  // Try RPC first
+  dlog('Calling RPC fetch_latest_cancellation with', userId);
+  try {
+    const { data, error } = await supabase.rpc('fetch_latest_cancellation', { p_user_id: userId });
+    if (error) {
+      dlog('RPC fetch_latest_cancellation error:', error);
+      throw error;
+    }
+    const row = Array.isArray(data) ? data?.[0] : data;
+    if (row) {
+      dlog('RPC fetch_latest_cancellation result:', row);
+      return row as CancellationRow;
+    }
+  } catch (e) {
+    dlog('RPC fetch_latest_cancellation failed:', e);
+  }
+
+  // Fallback to previous query
+  dlog('Falling back to .from("cancellations") query');
+  const { data, error } = await supabase
+    .from('cancellations')
+    .select('id, user_id, subscription_id, downsell_variant, accepted_downsell, reason, attributed_to_mm, applied_count, emailed_count, interview_count, visa_has_lawyer, visa_type, created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  const row = firstRow<CancellationRow>(data);
+  dlog('Fallback query resolved row:', row);
+  return row ?? null;
+}
+
+/**
+ * Load persisted answers for prefill. Prefers RPC and falls back to direct select.
+ */
+export async function fetchCancellationAnswers(
+  cancellationId: string
+): Promise<
+  | Pick<
+      CancellationRow,
+      | 'attributed_to_mm'
+      | 'applied_count'
+      | 'emailed_count'
+      | 'interview_count'
+      | 'reason'
+      | 'visa_has_lawyer'
+      | 'visa_type'
+    >
+  | null
+> {
+  if (!cancellationId) return null;
+
+  function dlog(...args: any[]) {
+    console.debug('[fetchCancellationAnswers]', ...args);
+  }
+
+  // Try RPC first
+  dlog('Calling RPC fetch_cancellation_answers with', cancellationId);
+  try {
+    const { data, error } = await supabase.rpc('fetch_cancellation_answers', { p_cancellation_id: cancellationId });
+    if (error) {
+      dlog('RPC fetch_cancellation_answers error:', error);
+      throw error;
+    }
+    const row = Array.isArray(data) ? data?.[0] : data;
+    if (row) return row as Pick<CancellationRow,'attributed_to_mm'|'applied_count'|'emailed_count'|'interview_count'|'reason'|'visa_has_lawyer'|'visa_type'>;
+  } catch (e) {
+    dlog('RPC fetch_cancellation_answers failed:', e);
+  }
+
+  // Fallback to previous query
+  dlog('Falling back to .from("cancellations") select query');
+  const { data, error } = await supabase
+    .from('cancellations')
+    .select(
+      'attributed_to_mm, applied_count, emailed_count, interview_count, reason, visa_has_lawyer, visa_type'
+    )
+    .eq('id', cancellationId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  const row = firstRow<Pick<CancellationRow,'attributed_to_mm'|'applied_count'|'emailed_count'|'interview_count'|'reason'|'visa_has_lawyer'|'visa_type'>>(data);
+  return row ?? null;
+}
 
 // --- Small utility ---------------------------------------------------
 
-/**
- * Fallback local 50/50 chooser (crypto-strong when available).
- * Prefer server-side `assignBalancedDownsell` for perfectly balanced groups.
- */
+/** Local 50/50 chooser - Backup for supabase server side choooser*/
 export function chooseVariantAB(): 'A' | 'B' {
   if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
     const buf = new Uint32Array(1)

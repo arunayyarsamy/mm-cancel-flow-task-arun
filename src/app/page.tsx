@@ -36,6 +36,7 @@ export default function ProfilePage() {
   const [selectedUserId, setSelectedUserId] = useState<string>('');
   const [dbLoading, setDbLoading] = useState<boolean>(false);
   const [dbError, setDbError] = useState<string | null>(null);
+  const [refreshSubscription, setRefreshSubscription] = useState<boolean>(false);
 
   // Structure and State for the subscription status for the current Selected User
   const [dbSub, setDbSub] = useState<null | {
@@ -45,6 +46,7 @@ export default function ProfilePage() {
     created_at?: string | null;
     updated_at?: string | null;
     user_id?: string | null;
+    pending_cancellation?: boolean | null;
   }>(null);
 
 
@@ -56,14 +58,14 @@ export default function ProfilePage() {
       try {
         var sub = await fetchLatestSubscription(selectedUserId);
         if (!alive) return;
-        setDbSub(sub as any);
+        setDbSub(sub ? { ...sub } as any : null);
       } catch (e) {
         if (!alive) return;
         // keep UI non-fatal
       }
     })();
     return () => { alive = false; };
-  }, [selectedUserId]);
+  }, [selectedUserId, refreshSubscription]);
 
   // Load the Users data for the dropdown. Only email + id 
   useEffect(() => {
@@ -76,6 +78,7 @@ export default function ProfilePage() {
         if (!alive) return;
         setDbUsers(users);
         setSelectedUserId(users.length ? users[0].id : '');
+    
       } catch (e) {
         if (!alive) return;
         setDbError('Failed to load users');
@@ -91,12 +94,11 @@ export default function ProfilePage() {
   // Derive UI subscription view from DB with mock fallbacks
   const uiSub = {
     status: (dbSub?.status ?? mockSubscriptionData.status) as string,
-    cancelAtPeriodEnd:
-      (dbSub?.status === 'pending_cancellation') || Boolean((dbSub as any)?.pending_cancellation) || false,
+    cancelAtPeriodEnd: Boolean((dbSub as any)?.pending_cancellation) || (dbSub?.status === 'pending_cancellation') || false,
     currentPeriodEnd: mockSubscriptionData.currentPeriodEnd, // no column in DB; keep mock date for UI
-  };
+  } as const;
 
-  const uiStatus = (uiSub.status || '').toLowerCase();
+  const uiStatus = (uiSub.status ?? '').toLowerCase();
   const isCancelled = uiStatus === 'cancelled';
   const canCancel = uiStatus === 'active' || uiStatus === 'pending_cancellation';
   const uiDateLabel = uiSub.currentPeriodEnd
@@ -403,9 +405,11 @@ export default function ProfilePage() {
       {/* Cancellation Modal */}
       <CancellationModal
         isOpen={showCancellationModal}
-        onClose={() => setShowCancellationModal(false)}
+        onClose={() =>  {
+          setShowCancellationModal(false);
+          setRefreshSubscription(prev => !prev);
+        }}
         userId={selectedUserId}
-        userEmail={selectedEmail}
       />
     </div>
   );
