@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { supabase } from '@/lib/supabase';
+import { supabase, ensureCancellation, saveFoundJobAnswers } from '@/lib/supabase';
 
 const COLORS = {
   brand: '#8952fc',
@@ -12,141 +12,8 @@ const COLORS = {
   successStrong: '#2ea743',
 };
 
-// ---------------------------------------------
-// Mock Models & In-Memory Repository (for UI dev)
-// This mirrors the eventual Supabase tables & fields
-// ---------------------------------------------
 
-export type PlanCode = 'starter' | 'pro' | 'plus';
-export type SubscriptionStatus = 'active' | 'canceled' | 'trialing' | 'past_due';
-export type DownsellVariant = 'A' | 'B';
-
-export type AppliedCount = '0' | '1-5' | '6-20' | '20+';
-export type EmailedCount = '0' | '1-5' | '6-20' | '20+';
-export type InterviewCount = '0' | '1-2' | '3-5' | '5+';
-
-export interface UserRow {
-  id: string;
-  email: string;
-  created_at: string;
-}
-
-export interface SubscriptionRow {
-  id: string;
-  user_id: string;
-  plan_code: PlanCode;
-  price_cents: number; // e.g., 2500 for $25
-  status: SubscriptionStatus;
-  pending_cancellation: boolean; // set true when user starts the flow
-  current_period_end: string; // ISO date
-  created_at: string;
-}
-
-export interface CancellationRow {
-  id: string;
-  user_id: string;
-  downsell_variant: DownsellVariant | null; // assigned once for still-looking path
-  accepted_downsell: boolean | null; // null until user chooses; true if accepted, false if declined
-  reason: string | null; // free-text feedback (step 2)
-  attributed_to_mm: boolean | null; // found-job path: whether job attributed to Migrate Mate
-  applied_count: AppliedCount | '';
-  emailed_count: EmailedCount | '';
-  interview_count: InterviewCount | '';
-  visa_has_lawyer: boolean | null;
-  visa_type: string | null;
-  created_at: string;
-}
-
-// Minimal ID helper for mocks
-const rid = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-// In-memory mock DB (for UI development only)
-export const MockDb = (() => {
-  const users = new Map<string, UserRow>();
-  const subs = new Map<string, SubscriptionRow>();
-  const cancels = new Map<string, CancellationRow>();
-
-  const nowIso = () => new Date().toISOString();
-
-  return {
-    // Seed a mock user + subscription if not present
-    seed(userId: string = '00000000-0000-0000-0000-000000000001') {
-      if (!users.has(userId)) {
-        users.set(userId, { id: userId, email: 'mock@migratemate.co', created_at: nowIso() });
-      }
-      const subId = `sub_${userId}`;
-      if (!subs.has(subId)) {
-        subs.set(subId, {
-          id: subId,
-          user_id: userId,
-          plan_code: 'starter',
-          price_cents: 2500,
-          status: 'active',
-          pending_cancellation: false,
-          current_period_end: new Date(Date.now() + 1000 * 60 * 60 * 24 * 21).toISOString(), // +21 days
-          created_at: nowIso(),
-        });
-      }
-      return { user: users.get(userId)!, subscription: subs.get(subId)! };
-    },
-
-    // Subscription mutations
-    markPendingCancellation(userId: string) {
-      const sub = subs.get(`sub_${userId}`);
-      if (!sub) throw new Error('No subscription');
-      subs.set(sub.id, { ...sub, pending_cancellation: true });
-      return subs.get(sub.id)!;
-    },
-
-    // Cancellation rows
-    getLatestCancellation(userId: string) {
-      // naive: return any row for user (single latest stored)
-      let latest: CancellationRow | undefined;
-      cancels.forEach((c) => { if (c.user_id === userId) latest = c; });
-      return latest || null;
-    },
-
-    createCancellation(userId: string, partial: Partial<CancellationRow> = {}) {
-      const id = rid();
-      const row: CancellationRow = {
-        id,
-        user_id: userId,
-        downsell_variant: partial.downsell_variant ?? null,
-        accepted_downsell: partial.accepted_downsell ?? null,
-        reason: partial.reason ?? null,
-        attributed_to_mm: partial.attributed_to_mm ?? null,
-        applied_count: (partial.applied_count as AppliedCount) ?? '',
-        emailed_count: (partial.emailed_count as EmailedCount) ?? '',
-        interview_count: (partial.interview_count as InterviewCount) ?? '',
-        visa_has_lawyer: partial.visa_has_lawyer ?? null,
-        visa_type: partial.visa_type ?? null,
-        created_at: nowIso(),
-      };
-      cancels.set(id, row);
-      return row;
-    },
-
-    updateCancellation(id: string, patch: Partial<CancellationRow>) {
-      const cur = cancels.get(id);
-      if (!cur) throw new Error('Cancellation not found');
-      const next = { ...cur, ...patch } as CancellationRow;
-      cancels.set(id, next);
-      return next;
-    },
-
-    // Deterministic A/B helper for still-looking branch
-    getOrAssignDownsellVariant(userId: string): { id: string; variant: DownsellVariant } {
-      const latest = this.getLatestCancellation(userId);
-      if (latest && latest.downsell_variant) return { id: latest.id, variant: latest.downsell_variant };
-      const pick: DownsellVariant = (new Uint32Array(1).map(() => 0), Math.random() < 0.5) ? 'A' : 'B';
-      const row = this.createCancellation(userId, { downsell_variant: pick });
-      return { id: row.id, variant: pick };
-    },
-  };
-})();
-// ---------------------------------------------
-
-type CancellationStep = 'initial' | 'job-status' | 'downsell' | 'downsell-accepted' | 'feedback' | 'confirmation' | 'completed';
+type CancellationStep = 'initial' | 'job-status' | 'downsell' | 'downsell-accepted' | 'using' | 'reasons' | 'feedback' | 'confirmation' | 'completed';
 
 interface CancellationModalProps {
   isOpen: boolean;
@@ -163,6 +30,10 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
   const [interviewCount, setInterviewCount] = useState<'0' | '1-2' | '3-5' | '5+' | ''>('');
   const [visaHasLawyer, setVisaHasLawyer] = useState<boolean | null>(null);
   const [visaType, setVisaType] = useState('');
+  const [reasonChoice, setReasonChoice] = useState<null | 'too_expensive' | 'not_helpful' | 'not_enough_jobs' | 'decided_not_to_move' | 'other'>(null);
+  const [reasonText, setReasonText] = useState('');
+  const [maxPrice, setMaxPrice] = useState('');
+  const [reasonTouched, setReasonTouched] = useState(false);
   // Deterministic downsell (A/B) for users who are still looking
   const [downsellVariant, setDownsellVariant] = useState<'A' | 'B' | null>(null);
   const [acceptedDownsell, setAcceptedDownsell] = useState<boolean>(false);
@@ -235,6 +106,10 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
       case 'job-status':
       case 'downsell':
         return 1;
+      case 'using':
+        return 2;
+      case 'reasons':
+        return 3;
       case 'feedback':
         return 2;
       case 'confirmation':
@@ -245,6 +120,11 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
   };
 
   const handleBack = () => {
+    if (currentStep === 'using') {
+      if (downsellVariant === 'B' && !acceptedDownsell) setCurrentStep('downsell');
+      else setCurrentStep('initial');
+      return;
+    }
     if (currentStep === 'job-status') {
       setCurrentStep('initial');
     } else if (currentStep === 'feedback') {
@@ -253,6 +133,8 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
       else setCurrentStep('initial');
     } else if (currentStep === 'downsell') {
       setCurrentStep('initial');
+    } else if (currentStep === 'reasons') {
+      setCurrentStep('using');
     } else if (currentStep === 'downsell-accepted') {
       // after accepting offer, treat as terminal or go back to downsell if you prefer
       setCurrentStep('downsell');
@@ -264,6 +146,14 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
   const handleOptionSelect = async (option: 'found-job' | 'still-looking') => {
     setSelectedOption(option);
     if (option === 'found-job') {
+      // Ensure a cancellation row exists for this user and keep its id
+      try {
+        const userId = getMockUserId();
+        const row = await ensureCancellation(userId, null);
+        setCancellationId(row.id);
+      } catch (e) {
+        console.error('Failed to ensure cancellation row', e);
+      }
       setCurrentStep('job-status');
       return;
     }
@@ -273,16 +163,31 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
       setDownsellVariant(res.variant);
       setCancellationId(res.id);
       if (res.variant === 'B') setCurrentStep('downsell');
-      else setCurrentStep('feedback');
+      else setCurrentStep('using');
     } finally {
       setAbLoading(false);
     }
   };
 
-  const handleFeedbackSubmit = () => {
-    // Here you would typically send this data to your backend
-    console.log('User selected:', selectedOption);
-    console.log('User feedback:', feedback);
+  const handleFeedbackSubmit = async () => {
+    try {
+      // Persist step 1+2 answers only for found-job branch
+      if (selectedOption === 'found-job' && cancellationId) {
+        await saveFoundJobAnswers(cancellationId, {
+          attributed_to_mm: attributedToMM ?? undefined,
+          applied_count: (appliedCount || undefined) as any,
+          emailed_count: (emailedCount || undefined) as any,
+          interview_count: (interviewCount || undefined) as any,
+        });
+        // Save feedback text as reason if provided
+        const trimmed = feedback.trim();
+        if (trimmed.length > 0) {
+          await supabase.from('cancellations').update({ reason: trimmed }).eq('id', cancellationId);
+        }
+      }
+    } catch (e) {
+      console.error('Failed to persist feedback/answers', e);
+    }
     // Go to Step 3 and keep the modal open until the user completes cancellation
     setCurrentStep('confirmation');
   };
@@ -301,6 +206,10 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
     setAcceptedDownsell(false);
     setCancellationId(null);
     setAbLoading(false);
+    setReasonChoice(null);
+    setReasonText('');
+    setMaxPrice('');
+    setReasonTouched(false);
   };
 
   const handleClose = () => {
@@ -367,6 +276,9 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
 
   if (!isOpen) return null;
 
+  // Show back button on all steps except initial, completed, downsell-accepted
+  const showBack = !['initial','completed','downsell-accepted'].includes(currentStep);
+
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50">
       <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full overflow-hidden">
@@ -374,7 +286,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
         <div className="px-4 py-3 border-b border-gray-200">
           <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2">
             {/* Back (left) */}
-            {currentStep !== 'initial' ? (
+            {showBack ? (
               <button
                 onClick={handleBack}
                 aria-label="Back"
@@ -396,7 +308,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                     ? 'Subscription'
                     : 'Subscription Cancellation'}
               </p>
-              {(currentStep === 'job-status' || currentStep === 'downsell' || currentStep === 'feedback' || currentStep === 'confirmation' || currentStep === 'completed') && (
+              {(currentStep === 'job-status' || currentStep === 'downsell' || currentStep === 'using' || currentStep === 'feedback' || currentStep === 'confirmation' || currentStep === 'completed') && (
                 <div className="mt-1 md:mt-0 flex items-center gap-2">
                   <div className="flex items-center gap-1.5">
                     {[1,2,3].map((n) => {
@@ -611,10 +523,183 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
 
                   {/* Secondary action */}
                   <button
-                    onClick={() => setCurrentStep('feedback')}
+                    onClick={() => setCurrentStep('using')}
                     className="w-full select-none touch-manipulation rounded-2xl border-2 border-gray-300 bg-white px-4 py-3 text-[16px] font-semibold text-gray-800 shadow-sm transition-colors md:hover:bg-rose-600 md:hover:border-rose-600 md:hover:text-white active:bg-rose-600 active:border-rose-600 active:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-600"
                   >
                     No thanks
+                  </button>
+                </>
+              )}
+
+              {/* New 'using' step for still-looking path */}
+              {currentStep === 'using' && (
+                <>
+                  <h3 className="text-[26px] md:text-[30px] font-extrabold text-gray-900 mb-3">
+                    Help us understand how you were using Migrate Mate.
+                  </h3>
+                  <div className="space-y-5">
+                    <div>
+                      <p className="text-sm font-medium text-gray-700 mb-2">
+                        How many roles did you apply for through Migrate Mate?*
+                      </p>
+                      <Segments options={['0','1-5','6-20','20+']} value={appliedCount} onChange={(v)=>setAppliedCount(v as any)} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-700 mb-2">
+                        How many companies did you email directly?*
+                      </p>
+                      <Segments options={['0','1-5','6-20','20+']} value={emailedCount} onChange={(v)=>setEmailedCount(v as any)} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-700 mb-2">
+                        How many different companies did you interview with?*
+                      </p>
+                      <Segments options={['0','1-2','3-5','5+']} value={interviewCount} onChange={(v)=>setInterviewCount(v as any)} />
+                    </div>
+                    {/* Green CTA for B variant & not accepted */}
+                    {downsellVariant === 'B' && !acceptedDownsell && (
+                      <div>
+                        <button
+                          className="w-full rounded-xl text-white text-[16px] font-sans font-semibold py-2.5 md:py-3 transition"
+                          style={{ backgroundColor: hoverDownsellCTA ? COLORS.successStrong : COLORS.success }}
+                          onMouseEnter={() => setHoverDownsellCTA(true)}
+                          onMouseLeave={() => setHoverDownsellCTA(false)}
+                          onClick={async () => {
+                            setAcceptedDownsell(true);
+                            if (cancellationId) {
+                              try { await supabase.from('cancellations').update({ accepted_downsell: true }).eq('id', cancellationId); } catch {}
+                            }
+                            setCurrentStep('downsell-accepted');
+                          }}
+                        >
+                          Get 50% off
+                        </button>
+                      </div>
+                    )}
+                    <div className="pt-2">
+                      <button
+                        disabled={!appliedCount || !emailedCount || !interviewCount}
+                        className={
+                          'rounded-2xl px-4 py-3 text-[15px] font-semibold ' +
+                          (!appliedCount || !emailedCount || !interviewCount
+                            ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                            : 'bg-rose-600 hover:bg-rose-700 text-white')
+                        }
+                        style={
+                          (!appliedCount || !emailedCount || !interviewCount)
+                            ? undefined
+                            : undefined
+                        }
+                        onClick={() => {
+                          if (appliedCount && emailedCount && interviewCount) setCurrentStep('reasons');
+                        }}
+                      >
+                        Continue
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {currentStep === 'reasons' && (
+                <>
+                  <h3 className="text-[26px] md:text-[28px] font-extrabold text-gray-900 mb-2">What’s the main reason for cancelling?</h3>
+                  <p className="text-[14px] md:text-[15px] text-gray-600 mb-4">Please take a minute to let us know why.</p>
+
+                  {/* Radio list */}
+                  <div className="space-y-3 mb-4">
+                    {[
+                      { key: 'too_expensive', label: 'Too expensive' },
+                      { key: 'not_helpful', label: 'Platform not helpful' },
+                      { key: 'not_enough_jobs', label: 'Not enough relevant jobs' },
+                      { key: 'decided_not_to_move', label: 'Decided not to move' },
+                      { key: 'other', label: 'Other' },
+                    ].map((r) => (
+                      <label key={r.key} className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="reason"
+                          className="h-4 w-4 text-indigo-600"
+                          checked={reasonChoice === (r.key as any)}
+                          onChange={() => { setReasonChoice(r.key as any); setReasonTouched(true); }}
+                        />
+                        <span className="text-sm text-gray-800">{r.label}</span>
+                      </label>
+                    ))}
+                  </div>
+
+                  {/* Conditional inputs */}
+                  {reasonChoice === 'too_expensive' ? (
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">What would be the maximum you’d be willing to pay?</label>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">$</span>
+                        <input
+                          type="text"
+                          value={maxPrice}
+                          onChange={(e) => setMaxPrice(e.target.value)}
+                          className="w-full rounded-lg border border-gray-300 px-7 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white text-gray-900 placeholder-gray-400"
+                        />
+                      </div>
+                    </div>
+                  ) : reasonChoice ? (
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        {reasonChoice === 'not_helpful' && 'What can we change to make the platform more helpful?*'}
+                        {reasonChoice === 'not_enough_jobs' && 'In which way can we make the jobs more relevant?*'}
+                        {reasonChoice === 'decided_not_to_move' && 'What changed for you to decide to not move?*'}
+                        {reasonChoice === 'other' && 'What would have helped you the most?*'}
+                      </label>
+                      <div className="relative">
+                        <textarea
+                          value={reasonText}
+                          onChange={(e) => setReasonText(e.target.value)}
+                          onBlur={() => setReasonTouched(true)}
+                          rows={5}
+                          className={`w-full rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 resize-none bg-white text-gray-900 placeholder-gray-400 ${reasonTouched && reasonText.trim().length < 25 ? 'border-red-400 focus:ring-red-300' : 'border-gray-300 focus:ring-violet-500'}`}
+                        />
+                        <div className="pointer-events-none absolute bottom-2 right-3 text-xs text-gray-500">Min 25 characters ({Math.min(reasonText.trim().length,25)}/25)</div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {/* Actions */}
+                  {downsellVariant === 'B' && !acceptedDownsell && (
+                    <button
+                      className="w-full rounded-xl text-white text-[16px] font-sans font-semibold py-2.5 md:py-3 transition mb-3"
+                      style={{ backgroundColor: hoverDownsellCTA ? COLORS.successStrong : COLORS.success }}
+                      onMouseEnter={() => setHoverDownsellCTA(true)}
+                      onMouseLeave={() => setHoverDownsellCTA(false)}
+                      onClick={async () => {
+                        setAcceptedDownsell(true);
+                        if (cancellationId) {
+                          try { await supabase.from('cancellations').update({ accepted_downsell: true }).eq('id', cancellationId); } catch {}
+                        }
+                        setCurrentStep('downsell-accepted');
+                      }}
+                    >
+                      Get 50% off
+                    </button>
+                  )}
+
+                  <button
+                    disabled={!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25)}
+                    className={`w-full rounded-2xl px-4 py-3 text-[15px] font-semibold transition-colors ${!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25) ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'text-white'}`}
+                    style={!reasonChoice || (reasonChoice !== 'too_expensive' && reasonText.trim().length < 25) ? undefined : { backgroundColor: hoverCompleteCancel ? COLORS.brandStrong : COLORS.brand }}
+                    onMouseEnter={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || reasonText.trim().length >= 25)) setHoverCompleteCancel(true); }}
+                    onMouseLeave={() => { if (reasonChoice && (reasonChoice === 'too_expensive' || reasonText.trim().length >= 25)) setHoverCompleteCancel(false); }}
+                    onClick={async () => {
+                      try {
+                        if (cancellationId) {
+                          const text = reasonChoice === 'too_expensive' ? (maxPrice ? `Too expensive; willing to pay $${maxPrice}` : 'Too expensive') : reasonText.trim();
+                          await supabase.from('cancellations').update({ reason: text || null }).eq('id', cancellationId);
+                        }
+                      } catch {}
+                      setVisaHasLawyer(false); // route to the generic "all sorted" completion
+                      setCurrentStep('completed');
+                    }}
+                  >
+                    Complete cancellation
                   </button>
                 </>
               )}
@@ -650,7 +735,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                 </>
               )}
 
-              {currentStep === 'feedback' && (
+              {currentStep === 'feedback' && selectedOption === 'found-job' && (
                 <>
                   <h3 className="text-[28px] md:text-[30px] font-extrabold text-gray-900 mb-3">
                     What’s one thing you wish we could’ve helped you with?
@@ -668,7 +753,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                         onBlur={() => setFeedbackTouched(true)}
                         placeholder="Share your thoughts with us..."
                         className={
-                          `w-full px-4 py-3 border rounded-lg focus:ring-2 focus:border-transparent resize-none ` +
+                          `w-full px-4 py-3 border rounded-lg focus:ring-2 focus:border-transparent resize-none bg-white text-gray-900 placeholder-gray-400 ` +
                           (feedbackTouched && feedback.trim().length < MIN_FEEDBACK
                             ? 'border-red-400 focus:ring-red-300'
                             : 'border-gray-300 focus:ring-violet-500')
@@ -679,6 +764,8 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                         Min {MIN_FEEDBACK} characters ({Math.min(feedback.trim().length, MIN_FEEDBACK)}/{MIN_FEEDBACK})
                       </div>
                     </div>
+
+                    {/* Optional green CTA for still-looking + B variant + not accepted */}
 
                     <div className="mt-4 flex items-center gap-3">
                       <button
@@ -764,7 +851,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                               value={visaType}
                               onChange={(e) => setVisaType(e.target.value)}
                               placeholder="e.g., H‑1B, O‑1, E‑3, TN…"
-                              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white text-gray-900 placeholder-gray-400"
                             />
                           </>
                         ) : (
@@ -781,7 +868,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                               value={visaType}
                               onChange={(e) => setVisaType(e.target.value)}
                               placeholder="e.g., H‑1B, O‑1, E‑3, TN…"
-                              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white text-gray-900 placeholder-gray-400"
                             />
                           </>
                         )}
@@ -790,7 +877,22 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
 
                     <div className="pt-2">
                       <button
-                        onClick={() => { setCurrentStep('completed'); }}
+                        onClick={async () => {
+                          try {
+                            if (cancellationId) {
+                              await supabase
+                                .from('cancellations')
+                                .update({
+                                  visa_has_lawyer: visaHasLawyer,
+                                  visa_type: visaType.trim() || null,
+                                })
+                                .eq('id', cancellationId);
+                            }
+                          } catch (e) {
+                            console.error('Failed to persist visa info', e);
+                          }
+                          setCurrentStep('completed');
+                        }}
                         disabled={visaHasLawyer === null || visaType.trim() === ''}
                         className={'w-full rounded-2xl px-4 py-3 text-[15px] font-semibold transition-colors ' +
                           (visaHasLawyer === null || visaType.trim() === ''
@@ -812,15 +914,18 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
               )}
 
               {currentStep === 'completed' && (
-                <>
-                  {visaHasLawyer ? (
-                    <div className="space-y-4">
-                      <h3 className="text-[24px] md:text-[26px] font-extrabold text-gray-900 leading-tight">
-                        All done, your cancellation’s been processed.
-                      </h3>
-                      <p className="text-sm text-gray-700">
-                        We’re stoked to hear you’ve landed a job and sorted your visa. Big congrats from the team. 🙌
-                      </p>
+                <div className="space-y-4">
+                  {selectedOption === 'still-looking' || selectedOption === null ? (
+                    <>
+                      <h3 className="text-[24px] md:text-[26px] font-extrabold text-gray-900 leading-tight">Sorry to see you go, mate.</h3>
+                      <div className="space-y-2 text-gray-800">
+                        <p className="text-[16px] md:text-[18px] font-semibold">Thanks for being with us, and you’re always welcome back.</p>
+                        <div className="text-sm text-gray-700">
+                          <p>Your subscription is set to end on XX date.</p>
+                          <p>You’ll still have full access until then. No further charges after that.</p>
+                        </div>
+                        <p className="text-xs md:text-sm text-gray-500">Changed your mind? You can reactivate anytime before your end date.</p>
+                      </div>
                       <div className="pt-2">
                         <button
                           onClick={handleClose}
@@ -828,34 +933,49 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                           style={{ backgroundColor: hoverFinish1 ? COLORS.brandStrong : COLORS.brand }}
                           onMouseEnter={() => setHoverFinish1(true)}
                           onMouseLeave={() => setHoverFinish1(false)}
-                        >Finish</button>
+                        >
+                          Back to Jobs
+                        </button>
                       </div>
-                    </div>
+                    </>
+                  ) : visaHasLawyer === true ? (
+                    <>
+                      <h3 className="text-[22px] md:text-[24px] font-extrabold text-gray-900 leading-tight">All done, your cancellation’s been processed.</h3>
+                      <p className="text-sm md:text-[15px] text-gray-700">We’re stoked to hear you’ve landed a job and sorted your visa. Big congrats from the team. 🙌</p>
+                      <div className="pt-2">
+                        <button
+                          onClick={handleClose}
+                          className="w-full rounded-2xl px-4 py-3 text-[15px] font-semibold text-white transition-colors"
+                          style={{ backgroundColor: hoverFinish1 ? COLORS.brandStrong : COLORS.brand }}
+                          onMouseEnter={() => setHoverFinish1(true)}
+                          onMouseLeave={() => setHoverFinish1(false)}
+                        >
+                          Finish
+                        </button>
+                      </div>
+                    </>
                   ) : (
-                    <div className="space-y-5">
-                      <h3 className="text-[24px] md:text-[26px] font-extrabold text-gray-900 leading-tight">
-                        Your cancellation’s all sorted, mate, no more charges.
-                      </h3>
-                      <div className="rounded-xl border border-gray-200 p-4 flex items-start gap-3 bg-white">
-                        <img src="/avatar-placeholder.png" alt="Visa advisor" className="h-10 w-10 rounded-full object-cover" onError={(e)=>{ (e.currentTarget as HTMLImageElement).style.display='none'; }} />
-                        <div className="text-sm text-gray-700">
-                          <p className="font-medium">Mihela Basic</p>
-                          <p className="text-gray-500 mb-2">mihela@migratemate.co</p>
-                          <p>I’ll be reaching out soon to help with the visa side of things. We’ve got your back, whether it’s questions, paperwork, or just figuring out your options. Keep an eye on your inbox; I’ll be in touch shortly.</p>
-                        </div>
+                    <>
+                      <h3 className="text-[22px] md:text-[24px] font-extrabold text-gray-900 leading-tight">Your cancellation’s all sorted, mate, no more charges.</h3>
+                      <div className="rounded-xl border border-gray-200 bg-gray-50 p-3 text-gray-700 text-sm">
+                        <p>We’ll be reaching out soon to help with the visa side of things.</p>
+                        <p className="mt-1">We’ve got your back, whether it’s questions, paperwork, or just figuring out your options.</p>
+                        <p className="mt-1 text-gray-500">Keep an eye on your inbox, we’ll be in touch shortly.</p>
                       </div>
-                      <div className="pt-1">
+                      <div className="pt-2">
                         <button
                           onClick={handleClose}
                           className="w-full rounded-2xl px-4 py-3 text-[15px] font-semibold text-white transition-colors"
                           style={{ backgroundColor: hoverFinish2 ? COLORS.brandStrong : COLORS.brand }}
                           onMouseEnter={() => setHoverFinish2(true)}
                           onMouseLeave={() => setHoverFinish2(false)}
-                        >Finish</button>
+                        >
+                          Finish
+                        </button>
                       </div>
-                    </div>
+                    </>
                   )}
-                </>
+                </div>
               )}
             </div>
           </div>
@@ -868,9 +988,7 @@ export default function CancellationModal({ isOpen, onClose }: CancellationModal
                 alt="New York City Skyline with Empire State Building"
                 className={`absolute inset-0 h-full w-full object-cover ${currentStep==='downsell-accepted' ? 'object-center md:scale-[1.08]' : 'object-center'}`}
                 onLoad={() => {
-                  console.log('Image loaded successfully');
-                  const el = document.querySelector('img[src="/empire-state-compressed.jpg"]') as HTMLImageElement | null;
-                  console.log('Image dimensions:', el?.naturalWidth, 'x', el?.naturalHeight);
+                  // Image loaded
                 }}
               />
             </div>

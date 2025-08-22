@@ -56,15 +56,15 @@ export type CancellationRow = {
 // --- Read helpers ----------------------------------------------------
 
 /**
+ * This is for tester only purpose
  * Load all users (for the selector).
- * We use a restricted view (user_emails_view) to maintain RLS and only expose id, email, and created_at,
+ * We use a restricted view (user_emails_view) to maintain RLS and only expose id, email
  * instead of querying the full users table directly.
  */
 export async function fetchUsers(): Promise<DbUser[]> {
   const { data, error } = await supabase
     .from('user_emails_view')
     .select('id,email')
-    .order('created_at', { ascending: true })
 
   if (error) throw error
   return (data ?? []) as DbUser[]
@@ -72,21 +72,18 @@ export async function fetchUsers(): Promise<DbUser[]> {
 
 /** Load the most recent subscription for a user. */
 export async function fetchLatestSubscription(userId: string): Promise<SubscriptionRow | null> {
-
-    console.log('fetchLatestSubscription', userId)
   if (!userId) return null
-  const { data, error } = await supabase
-    .from('subscriptions')
-    .select('id,user_id,status,monthly_price,created_at')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
 
-    console.log('fetchLatestSubscription', data, error)
+  const { data, error } = await supabase.rpc('fetch_latest_subscription', {
+    target_user: userId,
+  })
 
   if (error) throw error
-  return (data as SubscriptionRow) ?? null
+
+  // RPC returning TABLE can come back as an array (0..1 rows) depending on PostgREST
+  const row = Array.isArray(data) ? data?.[0] : data
+  console.log(row)
+  return (row as SubscriptionRow) ?? null
 }
 
 // --- Write helpers used by the cancellation flow ---------------------
@@ -166,6 +163,52 @@ export async function updateCancellation(
 
   if (error) throw error
 }
+
+// --- Found Job / Cancellation extensions ------------------------------
+
+/** Ensure a cancellation row exists for a user (create if not) */
+export async function ensureCancellation(userId: string, subscriptionId?: string | null): Promise<CancellationRow> {
+  if (!userId) throw new Error('userId required')
+  const { data: row, error } = await supabase
+    .from('cancellations')
+    .insert({ user_id: userId, subscription_id: subscriptionId ?? null })
+    .select('*')
+    .single()
+  if (error) throw error
+  return row as CancellationRow
+}
+
+/** Save mini‑survey answers about found job experience */
+export async function saveFoundJobAnswers(cancellationId: string, answers: {
+  attributed_to_mm?: boolean
+  applied_count?: '0' | '1-5' | '6-20' | '20+'
+  emailed_count?: '0' | '1-5' | '6-20' | '20+'
+  interview_count?: '0' | '1-2' | '3-5' | '5+'
+}): Promise<void> {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase
+    .from('cancellations')
+    .update(answers)
+    .eq('id', cancellationId)
+  if (error) throw error
+}
+
+/** Finalize cancellation row after found job flow */
+export async function finalizeFoundJobCancellation(cancellationId: string): Promise<void> {
+  if (!cancellationId) throw new Error('cancellationId required')
+  const { error } = await supabase
+    .from('cancellations')
+    .update({ reason: 'found_job' })
+    .eq('id', cancellationId)
+  if (error) throw error
+}
+
+// Namespaced export for integration
+export const CancellationFlowPersist = {
+  ensureCancellation,
+  saveFoundJobAnswers,
+  finalizeFoundJobCancellation,
+} as const
 
 // --- Small utility ---------------------------------------------------
 

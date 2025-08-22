@@ -26,11 +26,35 @@ CREATE TABLE IF NOT EXISTS cancellations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   subscription_id UUID REFERENCES subscriptions(id) ON DELETE CASCADE,
+  -- A/B assignment (persisted once)
   downsell_variant TEXT NOT NULL CHECK (downsell_variant IN ('A', 'B')),
+
+  -- Survey fields (found‑job branch first; extend for other branch later)
+  attributed_to_mm BOOLEAN, -- did they find the job via Migrate Mate?
+  applied_count TEXT CHECK (applied_count IN ('0','1-5','6-20','20+')),
+  emailed_count TEXT CHECK (emailed_count IN ('0','1-5','6-20','20+')),
+  interview_count TEXT CHECK (interview_count IN ('0','1-2','3-5','5+')),
+
+  -- Free‑text feedback
   reason TEXT,
+
+  -- Downsell outcome
   accepted_downsell BOOLEAN DEFAULT FALSE,
+
+  -- Visa info (step 3 in found‑job path)
+  visa_has_lawyer BOOLEAN,
+  visa_type TEXT,
+
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Idempotent column add (in case table already existed)
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS attributed_to_mm BOOLEAN;
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS applied_count TEXT CHECK (applied_count IN ('0','1-5','6-20','20+'));
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS emailed_count TEXT CHECK (emailed_count IN ('0','1-5','6-20','20+'));
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS interview_count TEXT CHECK (interview_count IN ('0','1-2','3-5','5+'));
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS visa_has_lawyer BOOLEAN;
+ALTER TABLE cancellations ADD COLUMN IF NOT EXISTS visa_type TEXT;
 
 -- Enable Row Level Security
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -90,12 +114,34 @@ CREATE POLICY "Users can update own cancellations" ON cancellations
 
 -- Narrow column exposure for anon via a view (test-friendly, RLS-safe)
 -- Exposes only id + email for the user selector; base table remains protected by RLS
-CREATE OR REPLACE VIEW public.user_choices AS
+CREATE OR REPLACE VIEW public.user_emails_view AS
   SELECT id, email
   FROM public.users;
 
 -- Allow anon to read ONLY from this view (not the base table)
-GRANT SELECT ON public.user_choices TO anon;
+GRANT SELECT ON public.user_emails_view TO anon;
+
+-- RPCs with SECURITY DEFINER (minimal set required)
+-- Fetch the latest subscription for a specific user (RLS-safe read path)
+CREATE OR REPLACE FUNCTION public.fetch_latest_subscription(target_user uuid)
+RETURNS TABLE (
+  id uuid,
+  user_id uuid,
+  status text,
+  monthly_price integer,
+  created_at timestamptz
+)
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+  SELECT s.id, s.user_id, s.status, s.monthly_price, s.created_at
+  FROM public.subscriptions s
+  WHERE s.user_id = target_user
+  ORDER BY s.created_at DESC, s.id DESC
+  LIMIT 1;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.fetch_latest_subscription(uuid) TO anon, authenticated;
 
 -- Hardening triggers ---------------------------------------------------
 
@@ -134,16 +180,38 @@ CREATE TRIGGER trg_cancellations_variant_guard
 BEFORE UPDATE ON public.cancellations
 FOR EACH ROW EXECUTE FUNCTION public.prevent_variant_change();
 
--- Enforce allowed subscription status transitions
+-- Enforce allowed subscription status transitions using a transition table
+CREATE TABLE IF NOT EXISTS subscription_status_transitions (
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  PRIMARY KEY (from_status, to_status)
+);
+
+-- Seed allowed transitions
+INSERT INTO subscription_status_transitions (from_status, to_status) VALUES
+  ('active', 'pending_cancellation'),
+  ('pending_cancellation', 'cancelled'),
+  ('pending_cancellation', 'active'),
+  ('active', 'cancelled')
+ON CONFLICT DO NOTHING;
+
+-- ('cancelled','active') -- Future: allow re-subscribe flow
+
 CREATE OR REPLACE FUNCTION public.enforce_subscription_status_transition()
 RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  allowed BOOLEAN;
 BEGIN
   IF NEW.status = OLD.status THEN
     RETURN NEW;
   END IF;
-  IF OLD.status = 'active' AND NEW.status IN ('pending_cancellation','cancelled') THEN
-    RETURN NEW;
-  ELSIF OLD.status = 'pending_cancellation' AND NEW.status = 'cancelled' THEN
+
+  SELECT EXISTS (
+    SELECT 1 FROM subscription_status_transitions
+    WHERE from_status = OLD.status AND to_status = NEW.status
+  ) INTO allowed;
+
+  IF allowed THEN
     RETURN NEW;
   ELSE
     RAISE EXCEPTION 'invalid status transition: % -> %', OLD.status, NEW.status;

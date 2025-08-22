@@ -1,12 +1,12 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { fetchUsers } from '../lib/supabase';
+import { fetchUsers, fetchLatestSubscription } from '../lib/supabase';
 import CancellationModal from '../components/CancellationModal';
 
 // Mock user data for UI display
 const mockUser = {
-  email: 'user@example.com',
+  email: 'user1@example.com',
   id: '1'
 };
 
@@ -37,6 +37,35 @@ export default function ProfilePage() {
   const [dbLoading, setDbLoading] = useState<boolean>(false);
   const [dbError, setDbError] = useState<string | null>(null);
 
+  // Structure and State for the subscription status for the current Selected User
+  const [dbSub, setDbSub] = useState<null | {
+    id?: string | null;
+    status?: string | null;
+    monthly_price?: number | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+    user_id?: string | null;
+  }>(null);
+
+
+  // Load the subscription data for the selected user.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!selectedUserId) { setDbSub(null); return; }
+      try {
+        var sub = await fetchLatestSubscription(selectedUserId);
+        if (!alive) return;
+        setDbSub(sub as any);
+      } catch (e) {
+        if (!alive) return;
+        // keep UI non-fatal
+      }
+    })();
+    return () => { alive = false; };
+  }, [selectedUserId]);
+
+  // Load the Users data for the dropdown. Only email + id 
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -58,6 +87,37 @@ export default function ProfilePage() {
   }, []);
 
   const selectedEmail = (dbUsers.find(u => u.id === selectedUserId)?.email) || mockUser.email;
+
+  // Derive UI subscription view from DB with mock fallbacks
+  const uiSub = {
+    status: (dbSub?.status ?? mockSubscriptionData.status) as string,
+    cancelAtPeriodEnd:
+      (dbSub?.status === 'pending_cancellation') || Boolean((dbSub as any)?.pending_cancellation) || false,
+    currentPeriodEnd: mockSubscriptionData.currentPeriodEnd, // no column in DB; keep mock date for UI
+  };
+
+  const uiStatus = (uiSub.status || '').toLowerCase();
+  const isCancelled = uiStatus === 'cancelled';
+  const canCancel = uiStatus === 'active' || uiStatus === 'pending_cancellation';
+  const uiDateLabel = uiSub.currentPeriodEnd
+    ? new Date(uiSub.currentPeriodEnd).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
+    : null;
+
+  // Settings the status for based on the user's subscription status
+  const statusBadge = (() => {
+    const map: Record<string, { label: string; cls: string }> = {
+      active: { label: 'Active', cls: 'bg-green-50 text-green-700 border border-green-200' },
+      pending_cancellation: { label: 'Pending cancellation', cls: 'bg-yellow-50 text-yellow-800 border border-yellow-200' },
+      cancelled: { label: 'Cancelled', cls: 'bg-red-50 text-red-700 border border-red-200' },
+    };
+    const entry = map[uiStatus] || null;
+    if (!entry) return null;
+    return (
+      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium ${entry.cls}`}>
+        {entry.label}
+      </span>
+    );
+  })();
 
   const handleSignOut = async () => {
     setIsSigningOut(true);
@@ -199,16 +259,11 @@ export default function ProfilePage() {
                     </div>
                     <p className="text-sm font-medium text-gray-900">Subscription status</p>
                   </div>
-                  <div className="flex items-center space-x-2">
-                    {mockSubscriptionData.status === 'active' && !mockSubscriptionData.isTrialSubscription && !mockSubscriptionData.cancelAtPeriodEnd && (
-                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                        Active
-                      </span>
-                    )}
-                  </div>
+                  <div className="flex items-center space-x-2">{statusBadge}</div>
                 </div>
 
-                {mockSubscriptionData.status === 'active' && !mockSubscriptionData.isTrialSubscription && !mockSubscriptionData.cancelAtPeriodEnd && (
+                {/* When ACTIVE or PENDING_CANCELLATION: show next payment */}
+                {(uiStatus === 'active' || uiStatus === 'pending_cancellation') && (
                   <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
                     <div className="flex items-center space-x-3">
                       <div className="flex-shrink-0">
@@ -218,14 +273,26 @@ export default function ProfilePage() {
                       </div>
                       <p className="text-sm font-medium text-gray-900">Next payment</p>
                     </div>
-                    <p className="text-sm font-medium text-gray-900">
-                      {mockSubscriptionData.currentPeriodEnd && new Date(mockSubscriptionData.currentPeriodEnd).toLocaleDateString('en-US', {
-                        month: 'long',
-                        day: 'numeric'
-                      })}
-                    </p>
+                    <p className="text-sm font-medium text-gray-900">{uiDateLabel}</p>
                   </div>
                 )}
+
+                {/* When CANCELLED: show active-until date */}
+                {uiStatus === 'cancelled' && uiDateLabel && (
+                  <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+                    <div className="flex items-center space-x-3">
+                      <div className="flex-shrink-0">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                      </div>
+                      <p className="text-sm font-medium text-gray-900">Active until</p>
+                    </div>
+                    <p className="text-sm font-medium text-gray-900">{uiDateLabel}</p>
+                  </div>
+                )}
+
+                {/* Pending cancellation: only the badge above */}
               </div>
             </div>
           </div>
@@ -297,17 +364,34 @@ export default function ProfilePage() {
                       </svg>
                       <span className="text-sm font-medium">View billing history</span>
                     </button>
-                    <button
-                      onClick={() => {
-                        setShowCancellationModal(true);
-                      }}
-                      className="inline-flex items-center justify-center w-full px-4 py-3 bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50 hover:border-red-300 transition-all duration-200 shadow-sm group"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2 group-hover:scale-110 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                      </svg>
-                      <span className="text-sm font-medium">Cancel Migrate Mate</span>
-                    </button>
+                    {/* Show Cancel when active or pending; show Resubscribe when cancelled */}
+                    {canCancel && (
+                      <button
+                        onClick={() => {
+                          setShowCancellationModal(true);
+                        }}
+                        className="inline-flex items-center justify-center w-full px-4 py-3 bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50 hover:border-red-300 transition-all duration-200 shadow-sm group"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2 group-hover:scale-110 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                        <span className="text-sm font-medium">Cancel Migrate Mate</span>
+                      </button>
+                    )}
+
+                    {isCancelled && (
+                      <button
+                        onClick={() => {
+                          console.log('Resubscribe clicked');
+                        }}
+                        className="inline-flex items-center justify-center w-full px-4 py-3 bg-white border border-green-200 text-green-700 rounded-lg hover:bg-green-50 hover:border-green-300 transition-all duration-200 shadow-sm group"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2 group-hover:scale-110 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v6h6M20 20v-6h-6M20 8a8 8 0 10-8 8" />
+                        </svg>
+                        <span className="text-sm font-medium">Resubscribe to Migrate Mate</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
